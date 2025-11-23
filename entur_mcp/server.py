@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Iterable, List, Mapping, Optional, Sequence, Union
 
 from fastmcp import FastMCP
-from mcp.types import ImageContent, TextContent
+from mcp.types import EmbeddedResource, ImageContent, TextContent
 from pydantic import BaseModel, Field
 
 from entur_mcp.models import (
@@ -30,6 +30,7 @@ from entur_mcp.ui import (
     generate_ascii_map,
     generate_map_image,
     generate_static_map_url,
+    generate_trip_map_html,
 )
 
 TransportMode = (
@@ -574,6 +575,143 @@ async def nearest_places_table(arguments: NearestPlacesArgs) -> List[TextContent
 
     table_markdown = "\n".join(lines)
     return [TextContent(type="text", text=table_markdown)]
+
+
+class PlanTripInteractiveArgs(BaseModel):
+    """Arguments for the plan_trip_interactive tool."""
+
+    from_place_id: Optional[str] = Field(
+        default=None,
+        description="Entur stop place id for the origin (e.g. 'NSR:StopPlace:58404').",
+    )
+    from_text: Optional[str] = Field(
+        default=None,
+        description="Free-text origin. The server resolves this using Entur's geocoder.",
+    )
+    from_latitude: Optional[float] = Field(
+        default=None,
+        description="Origin latitude in decimal degrees (WGS84).",
+    )
+    from_longitude: Optional[float] = Field(
+        default=None,
+        description="Origin longitude in decimal degrees (WGS84).",
+    )
+    to_place_id: Optional[str] = Field(
+        default=None,
+        description="Entur stop place id for the destination.",
+    )
+    to_text: Optional[str] = Field(
+        default=None,
+        description="Free-text destination. The server resolves this using Entur's geocoder.",
+    )
+    to_latitude: Optional[float] = Field(
+        default=None,
+        description="Destination latitude in decimal degrees (WGS84).",
+    )
+    to_longitude: Optional[float] = Field(
+        default=None,
+        description="Destination longitude in decimal degrees (WGS84).",
+    )
+    departure_time: Optional[str] = Field(
+        default=None,
+        description="ISO8601 timestamp for desired departure (defaults to now).",
+    )
+    arrive_by: Optional[bool] = Field(
+        default=False,
+        description="Interpret departure_time as latest arrival instead of earliest departure.",
+    )
+    itinerary_index: int = Field(
+        default=0,
+        ge=0,
+        le=9,
+        description="Which itinerary option to display on the map (0-9, default: 0 for first option).",
+    )
+    transport_modes: Optional[list[str]] = Field(
+        default=None,
+        description="Optional list of transport modes to prioritise "
+        "(e.g. ['rail', 'bus']). Valid modes: " + ", ".join(TransportMode),
+    )
+
+
+@server.tool(
+    name="plan_trip_interactive",
+    description=(
+        "Plan a trip and return an interactive HTML map that can be displayed in an iframe. "
+        "The map uses Leaflet.js with OpenStreetMap tiles and shows the route with clickable markers. "
+        "This provides a fully interactive pan/zoom experience. "
+        "Note: Requires MCP Apps support in the client to render the HTML."
+    ),
+)
+async def plan_trip_interactive(
+    arguments: PlanTripInteractiveArgs,
+) -> List[Union[TextContent, EmbeddedResource]]:
+    """Plan a trip and return with interactive HTML map."""
+
+    data = arguments.model_dump()
+    _validate_location_arguments(data, prefixes=("from", "to"))
+    _validate_allowed_values(arguments.transport_modes, TransportMode, "transport modes")
+
+    try:
+        result = await service.plan_trip(
+            from_place_id=arguments.from_place_id,
+            from_text=arguments.from_text,
+            from_latitude=arguments.from_latitude,
+            from_longitude=arguments.from_longitude,
+            to_place_id=arguments.to_place_id,
+            to_text=arguments.to_text,
+            to_latitude=arguments.to_latitude,
+            to_longitude=arguments.to_longitude,
+            departure_time=arguments.departure_time,
+            arrive_by=arguments.arrive_by,
+            page_cursor=None,
+            num_trip_patterns=5,
+            search_window=None,
+            transport_modes=arguments.transport_modes,
+        )
+    except (LocationLookupError, TripPlanningError) as exc:
+        raise ValueError(str(exc)) from exc
+    except EnturServiceError as exc:
+        raise ValueError(f"Entur service error: {exc}") from exc
+
+    content: List[Union[TextContent, EmbeddedResource]] = []
+
+    # Generate text summary
+    from_name = result.from_place.name
+    to_name = result.to_place.name
+    summary_lines = [f"## Journey: {from_name} to {to_name}"]
+
+    if result.itineraries:
+        itin = result.itineraries[min(arguments.itinerary_index, len(result.itineraries) - 1)]
+        from entur_mcp.ui import format_duration, format_time
+        summary_lines.append(f"**Option {arguments.itinerary_index + 1}:** {format_time(itin.start_time)} - {format_time(itin.end_time)} ({format_duration(itin.duration_seconds)})")
+        summary_lines.append("")
+        summary_lines.append(f"*Showing interactive map below (pan, zoom, click markers for details)*")
+    else:
+        summary_lines.append("No journey options found.")
+
+    content.append(TextContent(type="text", text="\n".join(summary_lines)))
+
+    # Generate interactive HTML map
+    if result.itineraries:
+        itinerary_idx = min(arguments.itinerary_index, len(result.itineraries) - 1)
+        html_map = generate_trip_map_html(result, itinerary_idx)
+
+        # Return as embedded resource with HTML content
+        from mcp.types import BlobResourceContents
+        import base64
+
+        content.append(
+            EmbeddedResource(
+                type="resource",
+                resource=BlobResourceContents(
+                    uri=f"data:text/html;base64,{base64.b64encode(html_map.encode()).decode()}",
+                    mimeType="text/html",
+                    blob=base64.b64encode(html_map.encode()).decode(),
+                ),
+            )
+        )
+
+    return content
 
 
 __all__ = ["server"]

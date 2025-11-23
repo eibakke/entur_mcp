@@ -456,3 +456,201 @@ def generate_ascii_map(coordinates: List[Tuple[float, float]], width: int = 50, 
     lines.append("```")
 
     return "\n".join(lines)
+
+
+def generate_interactive_map_html(
+    coordinates: List[Tuple[float, float]],
+    place_names: Optional[List[str]] = None,
+    title: str = "Journey Route",
+) -> str:
+    """Generate an interactive HTML map using Leaflet.js.
+
+    This creates a self-contained HTML document with an interactive map
+    that can be rendered in an MCP Apps iframe or saved as a standalone file.
+
+    Args:
+        coordinates: List of (lat, lon) tuples for the route
+        place_names: Optional list of place names corresponding to coordinates
+        title: Title for the map
+
+    Returns:
+        Complete HTML document string with embedded Leaflet map
+    """
+    if not coordinates:
+        return "<html><body><p>No route coordinates available.</p></body></html>"
+
+    # Calculate center and bounds
+    lats = [c[0] for c in coordinates]
+    lons = [c[1] for c in coordinates]
+
+    center_lat = sum(lats) / len(lats)
+    center_lon = sum(lons) / len(lons)
+
+    # Build markers JavaScript
+    markers_js = []
+    for i, (lat, lon) in enumerate(coordinates):
+        if i == 0:
+            color = "#22c55e"  # Green for origin
+            label = "A"
+            popup = place_names[i] if place_names and i < len(place_names) else "Origin"
+        elif i == len(coordinates) - 1:
+            color = "#ef4444"  # Red for destination
+            label = "B"
+            popup = place_names[i] if place_names and i < len(place_names) else "Destination"
+        else:
+            color = "#3b82f6"  # Blue for intermediate
+            label = str(i)
+            popup = place_names[i] if place_names and i < len(place_names) else f"Stop {i}"
+
+        markers_js.append(f"""
+        L.circleMarker([{lat}, {lon}], {{
+            radius: {12 if i == 0 or i == len(coordinates) - 1 else 8},
+            fillColor: '{color}',
+            color: '#ffffff',
+            weight: 2,
+            opacity: 1,
+            fillOpacity: 0.9
+        }}).addTo(map).bindPopup('<strong>{popup}</strong>');
+        """)
+
+    # Build polyline coordinates
+    polyline_coords = ", ".join([f"[{lat}, {lon}]" for lat, lon in coordinates])
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}
+        #map {{ width: 100%; height: 100vh; }}
+        .legend {{
+            background: white;
+            padding: 10px 14px;
+            border-radius: 8px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+            font-size: 13px;
+            line-height: 1.6;
+        }}
+        .legend-item {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .legend-dot {{
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            border: 2px solid white;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+        }}
+        .title-control {{
+            background: white;
+            padding: 8px 12px;
+            border-radius: 8px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+            font-weight: 600;
+            font-size: 14px;
+        }}
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script>
+        // Initialize map
+        const map = L.map('map').setView([{center_lat}, {center_lon}], 12);
+
+        // Add OpenStreetMap tiles
+        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }}).addTo(map);
+
+        // Add route polyline
+        const routeCoords = [{polyline_coords}];
+        const polyline = L.polyline(routeCoords, {{
+            color: '#3b82f6',
+            weight: 4,
+            opacity: 0.8,
+            dashArray: '10, 10'
+        }}).addTo(map);
+
+        // Add markers
+        {"".join(markers_js)}
+
+        // Fit map to route bounds with padding
+        map.fitBounds(polyline.getBounds(), {{ padding: [50, 50] }});
+
+        // Add legend
+        const legend = L.control({{ position: 'bottomright' }});
+        legend.onAdd = function(map) {{
+            const div = L.DomUtil.create('div', 'legend');
+            div.innerHTML = `
+                <div class="legend-item"><div class="legend-dot" style="background: #22c55e;"></div> Origin</div>
+                <div class="legend-item"><div class="legend-dot" style="background: #3b82f6;"></div> Stop</div>
+                <div class="legend-item"><div class="legend-dot" style="background: #ef4444;"></div> Destination</div>
+            `;
+            return div;
+        }};
+        legend.addTo(map);
+
+        // Add title
+        const titleControl = L.control({{ position: 'topleft' }});
+        titleControl.onAdd = function(map) {{
+            const div = L.DomUtil.create('div', 'title-control');
+            div.innerHTML = '{title}';
+            return div;
+        }};
+        titleControl.addTo(map);
+    </script>
+</body>
+</html>"""
+
+    return html
+
+
+def generate_trip_map_html(result: "TripPlanResult", itinerary_index: int = 0) -> str:
+    """Generate an interactive map HTML for a specific trip itinerary.
+
+    Args:
+        result: TripPlanResult from the Entur API
+        itinerary_index: Which itinerary to display (default: first one)
+
+    Returns:
+        Complete HTML document string with embedded Leaflet map
+    """
+    coordinates = []
+    place_names = []
+
+    # Add origin
+    if result.from_place.latitude and result.from_place.longitude:
+        coordinates.append((result.from_place.latitude, result.from_place.longitude))
+        place_names.append(result.from_place.name)
+
+    # Add itinerary stops
+    if result.itineraries and itinerary_index < len(result.itineraries):
+        itin = result.itineraries[itinerary_index]
+        for leg in itin.legs:
+            if leg.from_place and leg.from_place.latitude and leg.from_place.longitude:
+                coord = (leg.from_place.latitude, leg.from_place.longitude)
+                if not coordinates or coordinates[-1] != coord:
+                    coordinates.append(coord)
+                    place_names.append(leg.from_place.name)
+            if leg.to_place and leg.to_place.latitude and leg.to_place.longitude:
+                coord = (leg.to_place.latitude, leg.to_place.longitude)
+                if not coordinates or coordinates[-1] != coord:
+                    coordinates.append(coord)
+                    place_names.append(leg.to_place.name)
+
+    # Ensure destination is included
+    if result.to_place.latitude and result.to_place.longitude:
+        dest_coord = (result.to_place.latitude, result.to_place.longitude)
+        if not coordinates or coordinates[-1] != dest_coord:
+            coordinates.append(dest_coord)
+            place_names.append(result.to_place.name)
+
+    title = f"{result.from_place.name} to {result.to_place.name}"
+    return generate_interactive_map_html(coordinates, place_names, title)
