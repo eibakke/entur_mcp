@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Iterable, List, Mapping, Optional, Sequence, Union
 
 from fastmcp import FastMCP
+from mcp.types import ImageContent, TextContent
 from pydantic import BaseModel, Field
 
 from entur_mcp.models import (
@@ -20,6 +21,15 @@ from entur_mcp.service import (
     EnturServiceError,
     LocationLookupError,
     TripPlanningError,
+)
+from entur_mcp.ui import (
+    encode_image_base64,
+    extract_route_coordinates,
+    format_departures_table,
+    format_trip_plan_table,
+    generate_ascii_map,
+    generate_map_image,
+    generate_static_map_url,
 )
 
 TransportMode = (
@@ -397,6 +407,173 @@ async def service_alerts(arguments: ServiceAlertsArgs) -> ServiceAlertsResult:
 @server.tool
 def greet(name: str) -> str:
     return f"Hello, {name}!"
+
+
+# =============================================================================
+# UI-Enhanced Tools - Return rich formatted content for better visualization
+# =============================================================================
+
+
+@server.tool(
+    name="stop_departures_table",
+    description=(
+        "Retrieve upcoming departures for a stop place and return them as a formatted markdown table. "
+        "This tool provides a more user-friendly display with times, lines, destinations, platforms, and delay status."
+    ),
+)
+async def stop_departures_table(arguments: StopDeparturesArgs) -> List[TextContent]:
+    """Fetch realtime departures and format as a table."""
+
+    data = arguments.model_dump()
+    _validate_location_arguments(data, prefixes=("stop",))
+
+    try:
+        result = await service.get_stop_departures(
+            stop_place_id=arguments.stop_place_id,
+            stop_text=arguments.stop_text,
+            stop_latitude=arguments.stop_latitude,
+            stop_longitude=arguments.stop_longitude,
+            start_time=arguments.start_time,
+            time_range_minutes=arguments.time_range_minutes,
+            number_of_departures=arguments.number_of_departures,
+        )
+    except (LocationLookupError, DeparturesLookupError) as exc:
+        raise ValueError(str(exc)) from exc
+    except EnturServiceError as exc:
+        raise ValueError(f"Entur service error: {exc}") from exc
+
+    # Format as markdown table
+    table_markdown = format_departures_table(result)
+
+    return [TextContent(type="text", text=table_markdown)]
+
+
+@server.tool(
+    name="plan_trip_visual",
+    description=(
+        "Plan door-to-door trips between two places and return results with a visual map overview. "
+        "This tool provides formatted journey options as tables plus a route map visualization. "
+        "The map shows the origin (green), destination (red), and intermediate stops (blue)."
+    ),
+)
+async def plan_trip_visual(arguments: PlanTripArgs) -> List[Union[TextContent, ImageContent]]:
+    """Plan a trip and return with visual map."""
+
+    data = arguments.model_dump()
+    _validate_location_arguments(data, prefixes=("from", "to"))
+    _validate_allowed_values(arguments.transport_modes, TransportMode, "transport modes")
+
+    try:
+        result = await service.plan_trip(
+            from_place_id=arguments.from_place_id,
+            from_text=arguments.from_text,
+            from_latitude=arguments.from_latitude,
+            from_longitude=arguments.from_longitude,
+            to_place_id=arguments.to_place_id,
+            to_text=arguments.to_text,
+            to_latitude=arguments.to_latitude,
+            to_longitude=arguments.to_longitude,
+            departure_time=arguments.departure_time,
+            arrive_by=arguments.arrive_by,
+            page_cursor=arguments.page_cursor,
+            num_trip_patterns=arguments.num_trip_patterns,
+            search_window=arguments.search_window,
+            transport_modes=arguments.transport_modes,
+        )
+    except (LocationLookupError, TripPlanningError) as exc:
+        raise ValueError(str(exc)) from exc
+    except EnturServiceError as exc:
+        raise ValueError(f"Entur service error: {exc}") from exc
+
+    content: List[Union[TextContent, ImageContent]] = []
+
+    # Format trip details as markdown tables
+    trip_markdown = format_trip_plan_table(result)
+    content.append(TextContent(type="text", text=trip_markdown))
+
+    # Extract coordinates for map
+    coordinates = extract_route_coordinates(result)
+
+    if coordinates:
+        # Try to generate a map image
+        map_image = await generate_map_image(coordinates)
+
+        if map_image:
+            # Return base64 encoded image
+            content.append(
+                ImageContent(
+                    type="image",
+                    data=encode_image_base64(map_image),
+                    mimeType="image/png",
+                )
+            )
+        else:
+            # Fallback: add map URL and ASCII representation
+            map_url = generate_static_map_url(coordinates)
+            ascii_map = generate_ascii_map(coordinates)
+
+            map_text = "\n### Route Map\n"
+            if map_url:
+                map_text += f"\n[View interactive map]({map_url})\n"
+            if ascii_map:
+                map_text += f"\n{ascii_map}\n"
+
+            content.append(TextContent(type="text", text=map_text))
+
+    return content
+
+
+@server.tool(
+    name="nearest_places_table",
+    description=(
+        "Find nearby transport stops and return them as a formatted markdown table. "
+        "Shows place names, distances, and IDs for easy reference."
+    ),
+)
+async def nearest_places_table(arguments: NearestPlacesArgs) -> List[TextContent]:
+    """Find nearby places and format as a table."""
+
+    has_coordinates = arguments.latitude is not None and arguments.longitude is not None
+    if not (has_coordinates or arguments.text):
+        raise ValueError(
+            "Provide either both 'latitude' and 'longitude' or a 'text' query for nearest searches."
+        )
+
+    try:
+        result = await service.get_nearest_places(
+            latitude=arguments.latitude,
+            longitude=arguments.longitude,
+            text=arguments.text,
+            maximum_distance=float(arguments.maximum_distance),
+            maximum_results=arguments.maximum_results,
+            include_place_types=arguments.include_place_types,
+        )
+    except LocationLookupError as exc:
+        raise ValueError(str(exc)) from exc
+    except EnturServiceError as exc:
+        raise ValueError(f"Entur service error: {exc}") from exc
+
+    # Format as markdown table
+    lines = []
+    lines.append(f"## Nearest Places")
+    lines.append(f"*Search location: {result.latitude:.5f}, {result.longitude:.5f}*")
+    lines.append("")
+
+    if not result.places:
+        lines.append("No nearby places found.")
+    else:
+        lines.append("| # | Name | Distance | ID |")
+        lines.append("|---|------|----------|-----|")
+
+        for i, place in enumerate(result.places, 1):
+            name = place.place.name.replace("|", "\\|")
+            distance = f"{int(place.distance_meters)}m"
+            place_id = place.place.id
+
+            lines.append(f"| {i} | {name} | {distance} | `{place_id}` |")
+
+    table_markdown = "\n".join(lines)
+    return [TextContent(type="text", text=table_markdown)]
 
 
 __all__ = ["server"]
