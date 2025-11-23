@@ -654,3 +654,619 @@ def generate_trip_map_html(result: "TripPlanResult", itinerary_index: int = 0) -
 
     title = f"{result.from_place.name} to {result.to_place.name}"
     return generate_interactive_map_html(coordinates, place_names, title)
+
+
+def generate_searchable_map_html(
+    initial_coordinates: Optional[List[Tuple[float, float]]] = None,
+    initial_place_names: Optional[List[str]] = None,
+    center_lat: float = 59.91,  # Default to Oslo
+    center_lon: float = 10.75,
+    title: str = "Entur Journey Planner",
+) -> str:
+    """Generate an interactive HTML map with search and trip planning capabilities.
+
+    This creates a full-featured journey planning interface that can:
+    - Search for places using text input
+    - Click on map to set origin/destination
+    - Display route with markers
+    - Send trip planning requests back to the MCP host via postMessage
+
+    Args:
+        initial_coordinates: Optional initial route to display
+        initial_place_names: Optional place names for initial route
+        center_lat: Initial map center latitude (default: Oslo)
+        center_lon: Initial map center longitude (default: Oslo)
+        title: Title for the map interface
+
+    Returns:
+        Complete HTML document string with interactive journey planner
+    """
+    # Build initial markers if provided
+    initial_markers_js = ""
+    initial_polyline_js = ""
+
+    if initial_coordinates and len(initial_coordinates) >= 2:
+        markers_js_parts = []
+        for i, (lat, lon) in enumerate(initial_coordinates):
+            if i == 0:
+                color = "#22c55e"
+                popup = initial_place_names[i] if initial_place_names and i < len(initial_place_names) else "Origin"
+            elif i == len(initial_coordinates) - 1:
+                color = "#ef4444"
+                popup = initial_place_names[i] if initial_place_names and i < len(initial_place_names) else "Destination"
+            else:
+                color = "#3b82f6"
+                popup = initial_place_names[i] if initial_place_names and i < len(initial_place_names) else f"Stop {i}"
+
+            markers_js_parts.append(f"""
+            addMarker({lat}, {lon}, '{color}', '{popup}');
+            """)
+
+        initial_markers_js = "".join(markers_js_parts)
+
+        polyline_coords = ", ".join([f"[{lat}, {lon}]" for lat, lon in initial_coordinates])
+        initial_polyline_js = f"""
+        currentRoute = L.polyline([{polyline_coords}], {{
+            color: '#3b82f6',
+            weight: 4,
+            opacity: 0.8,
+            dashArray: '10, 10'
+        }}).addTo(map);
+        map.fitBounds(currentRoute.getBounds(), {{ padding: [50, 50] }});
+        """
+
+        # Update center to route center
+        center_lat = sum(c[0] for c in initial_coordinates) / len(initial_coordinates)
+        center_lon = sum(c[1] for c in initial_coordinates) / len(initial_coordinates)
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }}
+
+        .search-panel {{
+            background: #ffffff;
+            padding: 16px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            z-index: 1000;
+        }}
+
+        .search-panel h2 {{
+            font-size: 18px;
+            margin-bottom: 12px;
+            color: #1e293b;
+        }}
+
+        .search-row {{
+            display: flex;
+            gap: 12px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }}
+
+        .search-group {{
+            flex: 1;
+            min-width: 200px;
+        }}
+
+        .search-group label {{
+            display: block;
+            font-size: 12px;
+            font-weight: 600;
+            color: #64748b;
+            margin-bottom: 4px;
+            text-transform: uppercase;
+        }}
+
+        .search-input {{
+            width: 100%;
+            padding: 10px 12px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.2s;
+        }}
+
+        .search-input:focus {{
+            outline: none;
+            border-color: #3b82f6;
+        }}
+
+        .search-input.origin-set {{
+            border-color: #22c55e;
+            background-color: #f0fdf4;
+        }}
+
+        .search-input.destination-set {{
+            border-color: #ef4444;
+            background-color: #fef2f2;
+        }}
+
+        .button-row {{
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }}
+
+        .btn {{
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+
+        .btn-primary {{
+            background: #3b82f6;
+            color: white;
+        }}
+
+        .btn-primary:hover {{
+            background: #2563eb;
+        }}
+
+        .btn-primary:disabled {{
+            background: #94a3b8;
+            cursor: not-allowed;
+        }}
+
+        .btn-secondary {{
+            background: #f1f5f9;
+            color: #475569;
+        }}
+
+        .btn-secondary:hover {{
+            background: #e2e8f0;
+        }}
+
+        .btn-swap {{
+            background: #f1f5f9;
+            color: #475569;
+            padding: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+
+        .instructions {{
+            font-size: 12px;
+            color: #64748b;
+            margin-top: 8px;
+        }}
+
+        #map {{
+            flex: 1;
+            width: 100%;
+        }}
+
+        .status-bar {{
+            background: #1e293b;
+            color: white;
+            padding: 8px 16px;
+            font-size: 13px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+
+        .status-message {{
+            color: #94a3b8;
+        }}
+
+        .legend {{
+            background: white;
+            padding: 10px 14px;
+            border-radius: 8px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+            font-size: 12px;
+            line-height: 1.8;
+        }}
+
+        .legend-item {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+
+        .legend-dot {{
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            border: 2px solid white;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+        }}
+
+        .search-results {{
+            position: absolute;
+            background: white;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            max-height: 200px;
+            overflow-y: auto;
+            z-index: 2000;
+            display: none;
+        }}
+
+        .search-result-item {{
+            padding: 10px 12px;
+            cursor: pointer;
+            border-bottom: 1px solid #f1f5f9;
+        }}
+
+        .search-result-item:hover {{
+            background: #f8fafc;
+        }}
+
+        .search-result-item:last-child {{
+            border-bottom: none;
+        }}
+
+        .search-result-name {{
+            font-weight: 500;
+            color: #1e293b;
+        }}
+
+        .search-result-type {{
+            font-size: 11px;
+            color: #64748b;
+        }}
+    </style>
+</head>
+<body>
+    <div class="search-panel">
+        <h2>Plan Your Journey</h2>
+        <div class="search-row">
+            <div class="search-group" style="position: relative;">
+                <label>From</label>
+                <input type="text" id="origin-input" class="search-input" placeholder="Search or click map...">
+                <div id="origin-results" class="search-results"></div>
+            </div>
+            <button class="btn btn-swap" onclick="swapLocations()" title="Swap origin and destination">
+                &#8646;
+            </button>
+            <div class="search-group" style="position: relative;">
+                <label>To</label>
+                <input type="text" id="destination-input" class="search-input" placeholder="Search or click map...">
+                <div id="destination-results" class="search-results"></div>
+            </div>
+        </div>
+        <div class="button-row">
+            <button class="btn btn-primary" id="plan-btn" onclick="planTrip()" disabled>
+                Plan Trip
+            </button>
+            <button class="btn btn-secondary" onclick="clearAll()">
+                Clear All
+            </button>
+        </div>
+        <p class="instructions">
+            Click on the map to set origin (first click) and destination (second click), or use the search boxes above.
+        </p>
+    </div>
+
+    <div id="map"></div>
+
+    <div class="status-bar">
+        <span id="status-message" class="status-message">Click on the map or search to set your origin</span>
+        <span id="coordinates"></span>
+    </div>
+
+    <script>
+        // State
+        let origin = null;  // {{ lat, lon, name }}
+        let destination = null;
+        let originMarker = null;
+        let destinationMarker = null;
+        let currentRoute = null;
+        let markers = [];
+        let clickMode = 'origin';  // 'origin' or 'destination'
+        let searchTimeout = null;
+
+        // Initialize map
+        const map = L.map('map').setView([{center_lat}, {center_lon}], 12);
+
+        // Add OpenStreetMap tiles
+        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+        }}).addTo(map);
+
+        // Add legend
+        const legend = L.control({{ position: 'bottomright' }});
+        legend.onAdd = function(map) {{
+            const div = L.DomUtil.create('div', 'legend');
+            div.innerHTML = `
+                <div class="legend-item"><div class="legend-dot" style="background: #22c55e;"></div> Origin</div>
+                <div class="legend-item"><div class="legend-dot" style="background: #ef4444;"></div> Destination</div>
+                <div class="legend-item"><div class="legend-dot" style="background: #3b82f6;"></div> Route</div>
+            `;
+            return div;
+        }};
+        legend.addTo(map);
+
+        // Helper to add marker
+        function addMarker(lat, lon, color, popup) {{
+            const marker = L.circleMarker([lat, lon], {{
+                radius: 10,
+                fillColor: color,
+                color: '#ffffff',
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 0.9
+            }}).addTo(map);
+            if (popup) marker.bindPopup('<strong>' + popup + '</strong>');
+            markers.push(marker);
+            return marker;
+        }}
+
+        // Map click handler
+        map.on('click', function(e) {{
+            const lat = e.latlng.lat;
+            const lon = e.latlng.lng;
+
+            if (clickMode === 'origin') {{
+                setOrigin(lat, lon, `${{lat.toFixed(5)}}, ${{lon.toFixed(5)}}`);
+                clickMode = 'destination';
+                updateStatus('Now click to set your destination');
+            }} else {{
+                setDestination(lat, lon, `${{lat.toFixed(5)}}, ${{lon.toFixed(5)}}`);
+                clickMode = 'origin';
+            }}
+        }});
+
+        function setOrigin(lat, lon, name) {{
+            origin = {{ lat, lon, name }};
+
+            if (originMarker) map.removeLayer(originMarker);
+            originMarker = addMarker(lat, lon, '#22c55e', name);
+
+            document.getElementById('origin-input').value = name;
+            document.getElementById('origin-input').classList.add('origin-set');
+
+            updatePlanButton();
+            updateRoute();
+        }}
+
+        function setDestination(lat, lon, name) {{
+            destination = {{ lat, lon, name }};
+
+            if (destinationMarker) map.removeLayer(destinationMarker);
+            destinationMarker = addMarker(lat, lon, '#ef4444', name);
+
+            document.getElementById('destination-input').value = name;
+            document.getElementById('destination-input').classList.add('destination-set');
+
+            updatePlanButton();
+            updateRoute();
+        }}
+
+        function updateRoute() {{
+            if (currentRoute) {{
+                map.removeLayer(currentRoute);
+                currentRoute = null;
+            }}
+
+            if (origin && destination) {{
+                currentRoute = L.polyline([
+                    [origin.lat, origin.lon],
+                    [destination.lat, destination.lon]
+                ], {{
+                    color: '#3b82f6',
+                    weight: 4,
+                    opacity: 0.6,
+                    dashArray: '10, 10'
+                }}).addTo(map);
+
+                map.fitBounds(currentRoute.getBounds(), {{ padding: [50, 50] }});
+                updateStatus('Ready to plan trip!');
+            }}
+        }}
+
+        function updatePlanButton() {{
+            const btn = document.getElementById('plan-btn');
+            btn.disabled = !(origin && destination);
+        }}
+
+        function updateStatus(message) {{
+            document.getElementById('status-message').textContent = message;
+        }}
+
+        function swapLocations() {{
+            const tempOrigin = origin;
+            const tempDestination = destination;
+            const tempOriginMarker = originMarker;
+            const tempDestinationMarker = destinationMarker;
+
+            origin = null;
+            destination = null;
+
+            if (tempDestination) {{
+                setOrigin(tempDestination.lat, tempDestination.lon, tempDestination.name);
+            }}
+            if (tempOrigin) {{
+                setDestination(tempOrigin.lat, tempOrigin.lon, tempOrigin.name);
+            }}
+
+            if (!tempDestination) {{
+                document.getElementById('origin-input').value = '';
+                document.getElementById('origin-input').classList.remove('origin-set');
+            }}
+            if (!tempOrigin) {{
+                document.getElementById('destination-input').value = '';
+                document.getElementById('destination-input').classList.remove('destination-set');
+            }}
+        }}
+
+        function clearAll() {{
+            // Clear markers
+            if (originMarker) map.removeLayer(originMarker);
+            if (destinationMarker) map.removeLayer(destinationMarker);
+            markers.forEach(m => map.removeLayer(m));
+            if (currentRoute) map.removeLayer(currentRoute);
+
+            origin = null;
+            destination = null;
+            originMarker = null;
+            destinationMarker = null;
+            currentRoute = null;
+            markers = [];
+            clickMode = 'origin';
+
+            document.getElementById('origin-input').value = '';
+            document.getElementById('destination-input').value = '';
+            document.getElementById('origin-input').classList.remove('origin-set');
+            document.getElementById('destination-input').classList.remove('destination-set');
+
+            updatePlanButton();
+            updateStatus('Click on the map or search to set your origin');
+        }}
+
+        function planTrip() {{
+            if (!origin || !destination) return;
+
+            updateStatus('Requesting trip plan...');
+
+            // Send message to MCP host to trigger plan_trip tool
+            const message = {{
+                type: 'mcp_tool_call',
+                tool_name: 'plan_trip_interactive',
+                arguments: {{
+                    from_latitude: origin.lat,
+                    from_longitude: origin.lon,
+                    to_latitude: destination.lat,
+                    to_longitude: destination.lon
+                }}
+            }};
+
+            // Post message to parent (MCP host)
+            window.parent.postMessage(message, '*');
+
+            // Also log for debugging
+            console.log('Trip planning request:', message);
+            updateStatus('Trip plan request sent! Waiting for response...');
+        }}
+
+        // Search functionality using Entur's geocoder
+        async function searchPlaces(query, resultsElementId) {{
+            if (query.length < 2) {{
+                document.getElementById(resultsElementId).style.display = 'none';
+                return;
+            }}
+
+            try {{
+                // Use Entur's geocoder API
+                const url = `https://api.entur.io/geocoder/v1/autocomplete?text=${{encodeURIComponent(query)}}&size=5&lang=en`;
+                const response = await fetch(url, {{
+                    headers: {{
+                        'ET-Client-Name': 'EnturMCP-InteractiveMap'
+                    }}
+                }});
+
+                if (!response.ok) throw new Error('Search failed');
+
+                const data = await response.json();
+                const results = data.features || [];
+
+                const resultsDiv = document.getElementById(resultsElementId);
+                resultsDiv.innerHTML = '';
+
+                if (results.length === 0) {{
+                    resultsDiv.style.display = 'none';
+                    return;
+                }}
+
+                results.forEach(feature => {{
+                    const props = feature.properties || {{}};
+                    const coords = feature.geometry?.coordinates || [];
+
+                    if (coords.length < 2) return;
+
+                    const item = document.createElement('div');
+                    item.className = 'search-result-item';
+                    item.innerHTML = `
+                        <div class="search-result-name">${{props.name || 'Unknown'}}</div>
+                        <div class="search-result-type">${{props.locality || props.county || ''}}</div>
+                    `;
+
+                    item.onclick = () => {{
+                        const lon = coords[0];
+                        const lat = coords[1];
+                        const name = props.name || `${{lat.toFixed(5)}}, ${{lon.toFixed(5)}}`;
+
+                        if (resultsElementId === 'origin-results') {{
+                            setOrigin(lat, lon, name);
+                            map.setView([lat, lon], 14);
+                        }} else {{
+                            setDestination(lat, lon, name);
+                            map.setView([lat, lon], 14);
+                        }}
+
+                        resultsDiv.style.display = 'none';
+                    }};
+
+                    resultsDiv.appendChild(item);
+                }});
+
+                // Position results below input
+                const input = document.getElementById(resultsElementId.replace('-results', '-input'));
+                const rect = input.getBoundingClientRect();
+                resultsDiv.style.top = (rect.bottom + window.scrollY) + 'px';
+                resultsDiv.style.left = rect.left + 'px';
+                resultsDiv.style.width = rect.width + 'px';
+                resultsDiv.style.display = 'block';
+
+            }} catch (err) {{
+                console.error('Search error:', err);
+                document.getElementById(resultsElementId).style.display = 'none';
+            }}
+        }}
+
+        // Setup search inputs
+        document.getElementById('origin-input').addEventListener('input', (e) => {{
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => searchPlaces(e.target.value, 'origin-results'), 300);
+        }});
+
+        document.getElementById('destination-input').addEventListener('input', (e) => {{
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => searchPlaces(e.target.value, 'destination-results'), 300);
+        }});
+
+        // Close search results when clicking elsewhere
+        document.addEventListener('click', (e) => {{
+            if (!e.target.closest('.search-group')) {{
+                document.getElementById('origin-results').style.display = 'none';
+                document.getElementById('destination-results').style.display = 'none';
+            }}
+        }});
+
+        // Initialize with any existing route
+        {initial_markers_js}
+        {initial_polyline_js}
+
+        // Listen for messages from MCP host
+        window.addEventListener('message', function(event) {{
+            console.log('Received message from host:', event.data);
+            // Handle response from MCP host if needed
+            if (event.data.type === 'trip_result') {{
+                updateStatus('Trip planned successfully!');
+            }}
+        }});
+    </script>
+</body>
+</html>"""
+
+    return html

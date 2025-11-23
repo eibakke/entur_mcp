@@ -29,6 +29,7 @@ from entur_mcp.ui import (
     format_trip_plan_table,
     generate_ascii_map,
     generate_map_image,
+    generate_searchable_map_html,
     generate_static_map_url,
     generate_trip_map_html,
 )
@@ -710,6 +711,107 @@ async def plan_trip_interactive(
                 ),
             )
         )
+
+    return content
+
+
+class JourneyPlannerMapArgs(BaseModel):
+    """Arguments for the journey_planner_map tool."""
+
+    center_latitude: Optional[float] = Field(
+        default=None,
+        description="Initial map center latitude (defaults to Oslo: 59.91).",
+    )
+    center_longitude: Optional[float] = Field(
+        default=None,
+        description="Initial map center longitude (defaults to Oslo: 10.75).",
+    )
+    center_text: Optional[str] = Field(
+        default=None,
+        description="Free-text location to center the map on. Will be geocoded.",
+    )
+
+
+@server.tool(
+    name="journey_planner_map",
+    description=(
+        "Launch an interactive journey planning map interface. "
+        "This provides a full-featured HTML UI where users can: "
+        "1) Search for places using Entur's geocoder, "
+        "2) Click on the map to set origin and destination markers, "
+        "3) Swap origin/destination with one click, "
+        "4) Press 'Plan Trip' to send coordinates back to plan a journey. "
+        "The map uses Leaflet.js with OpenStreetMap tiles. "
+        "Note: Requires MCP Apps support in the client to render the HTML and handle postMessage callbacks."
+    ),
+)
+async def journey_planner_map(
+    arguments: JourneyPlannerMapArgs,
+) -> List[Union[TextContent, EmbeddedResource]]:
+    """Launch interactive journey planner map."""
+
+    # Determine center location
+    center_lat = 59.91  # Default: Oslo
+    center_lon = 10.75
+
+    if arguments.center_latitude is not None and arguments.center_longitude is not None:
+        center_lat = arguments.center_latitude
+        center_lon = arguments.center_longitude
+    elif arguments.center_text:
+        # Try to geocode the center location
+        try:
+            result = await service.get_nearest_places(
+                latitude=None,
+                longitude=None,
+                text=arguments.center_text,
+                maximum_distance=5000,
+                maximum_results=1,
+                include_place_types=None,
+            )
+            if result.places:
+                center_lat = result.latitude
+                center_lon = result.longitude
+        except Exception:
+            pass  # Use default if geocoding fails
+
+    content: List[Union[TextContent, EmbeddedResource]] = []
+
+    # Add instructions
+    instructions = """## Interactive Journey Planner Map
+
+**How to use:**
+1. **Search**: Type in the "From" or "To" boxes to search for places
+2. **Click**: Click anywhere on the map to set origin (first click) or destination (second click)
+3. **Swap**: Use the swap button (⇄) to reverse your journey
+4. **Plan**: Click "Plan Trip" to request journey options
+
+*The map below is interactive - pan, zoom, and click to explore!*
+"""
+    content.append(TextContent(type="text", text=instructions))
+
+    # Generate the searchable map HTML
+    html_map = generate_searchable_map_html(
+        initial_coordinates=None,
+        initial_place_names=None,
+        center_lat=center_lat,
+        center_lon=center_lon,
+        title="Entur Journey Planner",
+    )
+
+    # Return as embedded resource with HTML content
+    from mcp.types import BlobResourceContents
+    import base64
+
+    content.append(
+        EmbeddedResource(
+            type="resource",
+            resource=BlobResourceContents(
+                uri=f"data:text/html;base64,{base64.b64encode(html_map.encode()).decode()}",
+                mimeType="text/html",
+                blob=base64.b64encode(html_map.encode()).decode(),
+            ),
+        )
+    )
 
     return content
 
